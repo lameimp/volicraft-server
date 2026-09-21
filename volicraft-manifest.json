@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "files": [
+    {
+      "path": "Data/enUS/patch-enUS-4.MPQ",
+      "sha256": "3B6A427DC88F6EF37FDD115E9AA6C57B869557E11143A78B17003C1ACC57981A"
+    },
+    {
+      "path": "Data/enUS/patch-enUS-5.MPQ",
+      "sha256": "4FEF7ED6A3B24C90235AE902FFC8E77DC476FBEE073F749469F8FA8CE193FEFF"
+    }
+  ]
+}
