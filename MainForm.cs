@@ -1,7 +1,9 @@
 using System.Diagnostics;
+using System.Net.Http;
 using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace VolicraftLauncher;
 
@@ -11,6 +13,8 @@ internal sealed class MainForm : Form
     private const string DefaultRealmAddress = "127.0.0.1";
     private const int AuthPort = 3724;
     private const int WorldPort = 8085;
+    private const string LatestReleaseApi = "https://api.github.com/repos/lameimp/volicraft-server/releases/latest";
+    private static readonly HttpClient Http = CreateHttpClient();
 
     private readonly TextBox _clientPath = new();
     private readonly TextBox _serverAddress = new();
@@ -20,6 +24,7 @@ internal sealed class MainForm : Form
     private readonly Button _launch = new();
     private readonly Button _refreshNetwork = new();
     private readonly Button _verifyFiles = new();
+    private readonly Button _updateFiles = new();
     private readonly string _settingsPath;
 
     public MainForm()
@@ -64,6 +69,10 @@ internal sealed class MainForm : Form
         _verifyFiles.AutoSize = true;
         _verifyFiles.Click += async (_, _) => await VerifyCustomFilesAsync();
 
+        _updateFiles.Text = "Update Custom Files";
+        _updateFiles.AutoSize = true;
+        _updateFiles.Click += async (_, _) => await UpdateCustomFilesAsync();
+
         var layout = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
@@ -94,6 +103,7 @@ internal sealed class MainForm : Form
         layout.Controls.Add(_refreshNetwork, 1, 4);
         layout.Controls.Add(_tailscaleStatus, 2, 4);
         layout.Controls.Add(_verifyFiles, 1, 5);
+        layout.Controls.Add(_updateFiles, 2, 5);
         layout.Controls.Add(_status, 0, 6);
         layout.SetColumnSpan(_status, 3);
 
@@ -245,6 +255,63 @@ internal sealed class MainForm : Form
         }
     }
 
+    private async Task UpdateCustomFilesAsync()
+    {
+        SetBusy(true);
+        try
+        {
+            var clientRoot = ValidateClientRoot();
+            SetStatus("Checking GitHub for the latest Volicraft release...");
+            var release = await GetLatestReleaseAsync();
+            var manifestAsset = release.Assets.FirstOrDefault(asset =>
+                asset.Name.Equals("volicraft-manifest.json", StringComparison.OrdinalIgnoreCase));
+            if (manifestAsset is null)
+                throw new InvalidDataException("The latest GitHub Release has no manifest asset.");
+
+            var manifest = JsonSerializer.Deserialize<VolicraftManifest>(
+                await DownloadTextAsync(manifestAsset.BrowserDownloadUrl));
+            if (manifest?.Files is null || manifest.Files.Count == 0)
+                throw new InvalidDataException("The release manifest contains no files.");
+
+            var tempRoot = Path.Combine(Path.GetTempPath(), "VolicraftLauncher", Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(tempRoot);
+            try
+            {
+                foreach (var entry in manifest.Files)
+                {
+                    if (!IsAllowedCustomFile(entry.Path))
+                        throw new InvalidDataException($"Manifest contains an unsupported path: {entry.Path}");
+
+                    var asset = release.Assets.FirstOrDefault(candidate =>
+                        candidate.Name.Equals(Path.GetFileName(entry.Path), StringComparison.OrdinalIgnoreCase));
+                    if (asset is null)
+                        throw new InvalidDataException($"The release is missing {Path.GetFileName(entry.Path)}.");
+
+                    var tempFile = Path.Combine(tempRoot, Path.GetFileName(entry.Path));
+                    await DownloadFileAsync(asset.BrowserDownloadUrl, tempFile);
+                    await VerifyHashAsync(tempFile, entry.Sha256, entry.Path);
+                    await InstallVerifiedFileAsync(clientRoot, entry.Path, tempFile);
+                }
+            }
+            finally
+            {
+                Directory.Delete(tempRoot, recursive: true);
+            }
+
+            SetStatus($"Updated {manifest.Files.Count} custom file(s) from release {release.TagName}.");
+            _launch.Enabled = true;
+        }
+        catch (Exception ex) when (ex is ArgumentException or IOException or UnauthorizedAccessException or InvalidDataException or HttpRequestException)
+        {
+            _launch.Enabled = false;
+            SetStatus($"Update failed: {ex.Message}");
+        }
+        finally
+        {
+            SetBusy(false);
+        }
+    }
+
     private void LaunchClient()
     {
         try
@@ -304,6 +371,7 @@ internal sealed class MainForm : Form
             await client.ConnectAsync(host, port, cancellation.Token);
             return true;
         }
+
         catch (SocketException)
         {
             return false;
@@ -312,6 +380,61 @@ internal sealed class MainForm : Form
         {
             return false;
         }
+    }
+
+    private static HttpClient CreateHttpClient()
+    {
+        var client = new HttpClient();
+        client.DefaultRequestHeaders.UserAgent.ParseAdd("VolicraftLauncher/1.0");
+        return client;
+    }
+
+    private static async Task<GitHubRelease> GetLatestReleaseAsync()
+    {
+        await using var stream = await Http.GetStreamAsync(LatestReleaseApi);
+        var release = await JsonSerializer.DeserializeAsync<GitHubRelease>(stream);
+        return release ?? throw new InvalidDataException("GitHub returned an empty release response.");
+    }
+
+    private static Task<string> DownloadTextAsync(string url) => Http.GetStringAsync(url);
+
+    private static async Task DownloadFileAsync(string url, string destination)
+    {
+        await using var source = await Http.GetStreamAsync(url);
+        await using var target = File.Create(destination);
+        await source.CopyToAsync(target);
+    }
+
+    private static async Task VerifyHashAsync(string path, string expectedHash, string displayPath)
+    {
+        await using var stream = File.OpenRead(path);
+        var actualHash = Convert.ToHexString(await System.Security.Cryptography.SHA256.HashDataAsync(stream));
+        if (!actualHash.Equals(expectedHash, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidDataException($"Hash verification failed for {displayPath}.");
+    }
+
+    private static async Task InstallVerifiedFileAsync(string clientRoot, string relativePath, string source)
+    {
+        var normalized = relativePath.Replace('/', Path.DirectorySeparatorChar);
+        var destination = Path.GetFullPath(Path.Combine(clientRoot, normalized));
+        var root = Path.GetFullPath(clientRoot).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        if (!destination.StartsWith(root, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidDataException($"Manifest path is outside the client folder: {relativePath}");
+
+        Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
+        if (File.Exists(destination))
+            File.Move(destination, $"{destination}.volicraft-backup-{DateTime.Now:yyyyMMdd-HHmmss}");
+
+        await using var input = File.OpenRead(source);
+        await using var output = File.Create(destination);
+        await input.CopyToAsync(output);
+    }
+
+    private static bool IsAllowedCustomFile(string relativePath)
+    {
+        var normalized = relativePath.Replace('\\', '/');
+        return normalized.Equals("Data/enUS/patch-enUS-4.MPQ", StringComparison.OrdinalIgnoreCase)
+            || normalized.Equals("Data/enUS/patch-enUS-5.MPQ", StringComparison.OrdinalIgnoreCase);
     }
 
     private static async Task<TailscaleStatus> GetTailscaleStatusAsync()
@@ -413,4 +536,10 @@ internal sealed class MainForm : Form
     private sealed record ProcessResult(int ExitCode, string Output);
     private sealed record VolicraftManifest(int Version, List<ManifestFile> Files);
     private sealed record ManifestFile(string Path, string Sha256);
+    private sealed record GitHubRelease(
+        [property: JsonPropertyName("tag_name")] string TagName,
+        [property: JsonPropertyName("assets")] List<GitHubAsset> Assets);
+    private sealed record GitHubAsset(
+        [property: JsonPropertyName("name")] string Name,
+        [property: JsonPropertyName("browser_download_url")] string BrowserDownloadUrl);
 }
