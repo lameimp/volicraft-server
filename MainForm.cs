@@ -214,7 +214,7 @@ internal sealed class MainForm : Form
                 throw new FileNotFoundException("The launcher manifest is missing.");
 
             var manifest = JsonSerializer.Deserialize<VolicraftManifest>(
-                await File.ReadAllTextAsync(manifestPath));
+                await File.ReadAllTextAsync(manifestPath), JsonOptions);
             if (manifest?.Files is null || manifest.Files.Count == 0)
                 throw new InvalidDataException("The launcher manifest contains no files.");
 
@@ -269,7 +269,7 @@ internal sealed class MainForm : Form
                 throw new InvalidDataException("The latest GitHub Release has no manifest asset.");
 
             var manifest = JsonSerializer.Deserialize<VolicraftManifest>(
-                await DownloadTextAsync(manifestAsset.BrowserDownloadUrl));
+                await DownloadTextAsync(manifestAsset.BrowserDownloadUrl), JsonOptions);
             if (manifest?.Files is null || manifest.Files.Count == 0)
                 throw new InvalidDataException("The release manifest contains no files.");
 
@@ -388,6 +388,11 @@ internal sealed class MainForm : Form
         client.DefaultRequestHeaders.UserAgent.ParseAdd("VolicraftLauncher/1.0");
         return client;
     }
+
+    private static readonly JsonSerializerOptions JsonOptions = new()
+    {
+        PropertyNameCaseInsensitive = true
+    };
 
     private static async Task<GitHubRelease> GetLatestReleaseAsync()
     {
